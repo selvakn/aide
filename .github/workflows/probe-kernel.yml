@@ -1,0 +1,48 @@
+name: Probe Kernel Versions
+
+on:
+  push:
+    branches: ["probe-kernel-versions"]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    name: Kernel on ${{ matrix.os }}
+    steps:
+      - name: Print kernel info
+        run: |
+          echo "=== Runner: ${{ matrix.os }} ==="
+          uname -r
+          uname -a
+
+      - name: Check Landlock support
+        run: |
+          echo "--- /proc/sys/kernel/landlock ---"
+          if [ -d /proc/sys/kernel/landlock ]; then
+            ls /proc/sys/kernel/landlock/
+            cat /proc/sys/kernel/landlock/abi 2>/dev/null && echo " (landlock ABI)" || true
+          else
+            echo "Landlock not present in /proc/sys/kernel"
+          fi
+          echo "--- Security modules ---"
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true
+          grep -i landlock /sys/kernel/security/lsm 2>/dev/null && echo "(landlock in LSM list)" || echo "(landlock NOT in LSM list)"
+          echo "--- landlock_create_ruleset syscall probe ---"
+          python3 -c "
+          import ctypes, os
+          # landlock_create_ruleset syscall number on x86_64 is 444
+          NR_landlock_create_ruleset = 444
+          libc = ctypes.CDLL(None, use_errno=True)
+          # Call with NULL, 0, LANDLOCK_CREATE_RULESET_VERSION (1<<0 = 1) to get ABI version
+          ret = libc.syscall(NR_landlock_create_ruleset, None, 0, 1)
+          err = ctypes.get_errno()
+          if ret >= 0:
+              print(f'Landlock ABI version: {ret}')
+          else:
+              import errno
+              print(f'syscall returned {ret}, errno={err} ({os.strerror(err)})')
+          " 2>/dev/null || echo "python3 probe failed"
