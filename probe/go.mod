@@ -1,0 +1,10 @@
+module probe
+
+go 1.26.3
+
+require github.com/landlock-lsm/go-landlock v0.7.0
+
+require (
+	golang.org/x/sys v0.40.0 // indirect
+	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
+)
