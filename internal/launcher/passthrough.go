@@ -166,6 +166,12 @@ func (l *Launcher) execAgent(cwd, name, binary string, extraArgs []string) error
 		return fmt.Errorf("applying sandbox: %w", err)
 	}
 
+	// Compute the active isolation tier from the resolved policy. Mirrors the
+	// non-passthrough path in launcher.go so the banner reflects whether
+	// Landlock / Seatbelt is in force, instead of falling through to
+	// isolationTierLabel's nil-IsolationTier → "sandbox: disabled" default.
+	tier := sandbox.PlatformIsolationTier(policy)
+
 	// Render minimal startup banner
 	guardResults := sandbox.EvaluateGuards(&policy)
 	availableNames := sandbox.AvailableGuardNames(policy.Guards)
@@ -196,10 +202,11 @@ func (l *Launcher) execAgent(cwd, name, binary string, extraArgs []string) error
 	}
 	si.Available = availableNames
 	bannerData := &ui.BannerData{
-		AgentName: name,
-		AgentPath: binary,
-		Sandbox:   si,
-		Yolo:      l.Yolo && !l.NoYolo,
+		AgentName:     name,
+		AgentPath:     binary,
+		Sandbox:       si,
+		IsolationTier: &tier,
+		Yolo:          l.Yolo && !l.NoYolo,
 	}
 	if err := ui.RenderBanner(l.stderr(), "compact", bannerData); err != nil {
 		fmt.Fprintf(l.stderr(), "warning: banner render failed: %v\n", err)
