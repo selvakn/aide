@@ -329,10 +329,17 @@ func DeriveGrantedPathSet(policy Policy) GrantedPathSet {
 		readableSet[p] = true
 	}
 
-	// Apply deny-wins: remove any denied path from writable and readable.
-	for p := range deniedSet {
-		delete(writableSet, p)
-		delete(readableSet, p)
+	// Apply deny-wins: remove any path that is exactly denied or resides
+	// inside a denied directory subtree (prefix match with separator boundary).
+	for w := range writableSet {
+		if isUnderDeniedTree(w, deniedSet) {
+			delete(writableSet, w)
+		}
+	}
+	for r := range readableSet {
+		if isUnderDeniedTree(r, deniedSet) {
+			delete(readableSet, r)
+		}
 	}
 
 	return GrantedPathSet{
@@ -373,6 +380,22 @@ func resolveSymlinkForDeny(p string) string {
 		return filepath.Clean(p)
 	}
 	return resolved
+}
+
+// isUnderDeniedTree reports whether p is exactly in the denied set, or is a
+// descendant of a denied directory (prefix match terminated by a separator).
+// This ensures deny-wins applies to the entire subtree of a denied path, not
+// just the exact path, preventing a subtree allow from bypassing a point deny.
+func isUnderDeniedTree(p string, denied map[string]bool) bool {
+	if denied[p] {
+		return true
+	}
+	for d := range denied {
+		if strings.HasPrefix(p, d+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(m map[string]bool) []string {
