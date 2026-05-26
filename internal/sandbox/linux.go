@@ -600,10 +600,12 @@ func forkExecInPIDNamespace(agentPath string, agentCmd []string) error {
 			continue
 		}
 		signal.Stop(sigCh)
+		close(sigCh)
 		return fmt.Errorf("wait for sandboxed agent: %w", werr)
 	}
 
 	signal.Stop(sigCh)
+	close(sigCh)
 
 	if wstatus.Exited() {
 		os.Exit(wstatus.ExitStatus())
