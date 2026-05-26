@@ -148,6 +148,12 @@ func (l *Launcher) execAgent(cwd, name, binary string, extraArgs []string) error
 	policy.AgentModule = ResolveAgentModule(name)
 
 	env := applyAgentEnv(os.Environ(), &policy)
+	// Sync policy.Env with the post-injection env so the Landlock re-exec
+	// child builds its allow-list from the same env that cmd.Env carries.
+	// Mirrors step 12e in launcher.go; without this the child evaluates
+	// env-var-dependent guards (e.g. CLAUDE_CONFIG_DIR) from the stale
+	// pre-injection snapshot.
+	policy.Env = env
 
 	cmd := &exec.Cmd{
 		Path: binary,
