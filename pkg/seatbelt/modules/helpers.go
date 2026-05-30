@@ -159,6 +159,72 @@ func configDirRules(sectionName, home string, dirs []string) []seatbelt.Rule {
 	return rules
 }
 
+// expandConfigDirWritable returns the path list that must be added to the
+// Landlock writable allow-list for `dir` to be usable when dotfiles tools
+// have symlinked the dir or entries inside it elsewhere. Landlock evaluates
+// rules on the kernel-resolved path (the inode), not the literal syscall
+// argument. Without expansion, an allow on ~/.cursor does not cover writes
+// to ~/.cursor/skills/foo.md when ~/.cursor/skills is a symlink to
+// ~/dotfiles/cursor-skills/, because the resolved path lives under
+// ~/dotfiles/, not ~/.cursor/.
+//
+// Returned slice contains:
+//   - dir itself (always)
+//   - filepath.EvalSymlinks(dir) when it differs from dir and passes
+//     isSafeConfigOverride (covers whole-dir symlinks like
+//     ~/.cursor -> ~/dotfiles/cursor)
+//   - For each depth-1 entry under the resolved dir that is itself a
+//     symlink, one path:
+//       - resolved target (when target is a directory — tight scope, the
+//         agent writes inside the dir and atomic-rename siblings stay
+//         under the same inode tree)
+//       - parent of resolved target (when target is a regular file —
+//         broader scope; atomic-rename tmp siblings sit alongside the
+//         file, e.g. ~/dotfiles/bashrc + ~/dotfiles/.bashrc.tmp.PID)
+//
+// Paths outside $HOME or under sensitiveHomeDirs are filtered.
+//
+// The macOS-side analogue is collectSymlinkTargetParents (always parent
+// scope) in configDirRules — Seatbelt has the same kernel-resolved-path
+// semantics, but the Linux helper is tighter for the directory-symlink
+// case because Landlock rules can be scoped to the directory inode.
+func expandConfigDirWritable(home, dir string) []string {
+	paths := []string{dir}
+	resolved := fsutil.ResolveOrSelf(dir)
+	if resolved != dir && isSafeConfigOverride(home, resolved) {
+		paths = append(paths, resolved)
+	}
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		return paths
+	}
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		link := filepath.Join(resolved, e.Name())
+		target := fsutil.ResolveOrSelf(link)
+		if target == link {
+			// Broken symlink: ResolveOrSelf falls back to input on
+			// EvalSymlinks error. Skip; we don't widen the sandbox to a
+			// path that doesn't exist.
+			continue
+		}
+		info, statErr := os.Stat(target)
+		if statErr != nil {
+			continue
+		}
+		scope := target
+		if !info.IsDir() {
+			scope = filepath.Dir(target)
+		}
+		if isSafeConfigOverride(home, scope) {
+			paths = append(paths, scope)
+		}
+	}
+	return paths
+}
+
 // collectSymlinkTargetParents walks dir at depth 1 and returns the safe
 // parent-directory paths for each top-level symlink entry. The parent
 // (not the file literal) is used so atomic-write tmp+rename siblings in

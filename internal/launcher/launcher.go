@@ -25,6 +25,7 @@ import (
 	"github.com/jskswamy/aide/internal/secrets"
 	"github.com/jskswamy/aide/internal/trust"
 	"github.com/jskswamy/aide/internal/ui"
+	"github.com/jskswamy/aide/pkg/seatbelt"
 )
 
 //go:generate mockgen -destination=mocks/mock_execer.go -package=mocks github.com/jskswamy/aide/internal/launcher Execer
@@ -148,13 +149,22 @@ func (l *Launcher) Launch(cwd string, agentOverride string, extraArgs []string, 
 		}
 	}
 
+	// Resolve the user's home directory once. Every downstream caller
+	// (tilde expansion, sandbox policy, agent-env injection) reads this
+	// value rather than calling os.UserHomeDir() independently. A missing
+	// HOME is a hard configuration error — silently passing "" would cause
+	// sandbox rules and CLAUDE_CONFIG_DIR to resolve to wrong paths.
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolving home directory: %w", err)
+	}
+
 	// 3b. Validate + inject per-profile env (CLAUDE_CONFIG_DIR etc.)
 	// when ctx.Profile is set. Errors here are config errors and
 	// must abort the launch — profile mis-config silently launching
 	// against the wrong dir is the exact class of bug this feature
 	// fixes.
-	homeDirForProfile, _ := os.UserHomeDir()
-	mergedEnv, perr := provision.InjectProfileEnv(rc.Context, rc.Context.Env, homeDirForProfile)
+	mergedEnv, perr := provision.InjectProfileEnv(rc.Context, rc.Context.Env, homeDir)
 	if perr != nil {
 		return fmt.Errorf("context %q: %w", rc.Name, perr)
 	}
@@ -250,7 +260,6 @@ func (l *Launcher) Launch(cwd string, agentOverride string, extraArgs []string, 
 	// Tilde-expand leading "~/" in values so the child agent receives
 	// absolute paths. Agents (e.g. claude reading CLAUDE_CONFIG_DIR) don't
 	// expand "~" themselves, so an unexpanded value reads the wrong dir.
-	homeDir, _ := os.UserHomeDir()
 	for k, v := range resolvedEnv {
 		resolvedEnv[k] = homepath.Expand(v, homeDir)
 	}
@@ -352,6 +361,18 @@ func (l *Launcher) Launch(cwd string, agentOverride string, extraArgs []string, 
 			policy.Env = env
 			// 12c. Set agent module for sandbox profile
 			policy.AgentModule = ResolveAgentModule(agentName)
+			// 12d. Apply agent-module env overrides (e.g. claude's
+			// CLAUDE_CONFIG_DIR redirect to a sandbox-friendly location).
+			// AgentEnv observes the un-injected env via ctx.EnvLookup, so a
+			// user-set value is respected — module returns nil for that key
+			// and aide leaves it alone.
+			env = applyAgentEnv(env, policy)
+			// 12e. Sync policy.Env with the post-injection env so the
+			// re-exec child receives injected keys (e.g. CLAUDE_CONFIG_DIR)
+			// in its serialised policy. Without this, capability guards in
+			// the child evaluate env-var-dependent paths from the stale
+			// pre-injection snapshot and may grant the wrong Landlock path.
+			policy.Env = env
 
 			cmd := &exec.Cmd{
 				Path: binary,
@@ -577,6 +598,27 @@ func mergeEnv(base []string, resolved map[string]string) []string {
 	return result
 }
 
+// applyAgentEnv merges env-var overrides declared by the policy's
+// AgentModule (via the optional seatbelt.EnvProvider interface). Modules
+// use this to inject sandbox-friendly values (e.g. CLAUDE_CONFIG_DIR
+// pointing at an aide-managed dir) while respecting user-set values —
+// each implementation checks ctx.EnvLookup first and returns nil for
+// keys the user already set.
+func applyAgentEnv(env []string, policy *sandbox.Policy) []string {
+	if policy == nil || policy.AgentModule == nil {
+		return env
+	}
+	provider, ok := policy.AgentModule.(seatbelt.EnvProvider)
+	if !ok {
+		return env
+	}
+	overrides := provider.AgentEnv(policy.ToSeatbeltContext())
+	if len(overrides) == 0 {
+		return env
+	}
+	return mergeEnv(env, overrides)
+}
+
 // buildBannerData constructs a BannerData from the resolved context and launch state.
 func (l *Launcher) buildBannerData(
 	rc *aidectx.ResolvedContext,
@@ -703,6 +745,8 @@ func (l *Launcher) buildBannerData(
 		tempDir := os.TempDir()
 		policy, _, _ := sandbox.PolicyFromConfig(sandboxCfg, sandbox.Paths{ProjectRoot: projectRoot, RuntimeDir: rtDirPath, HomeDir: homeDir, TempDir: tempDir})
 		if policy != nil {
+			tier := sandbox.PlatformIsolationTier(*policy)
+			data.IsolationTier = &tier
 			guardResults := sandbox.EvaluateGuards(policy)
 			availableNames := sandbox.AvailableGuardNames(policy.Guards)
 			si := &ui.SandboxInfo{

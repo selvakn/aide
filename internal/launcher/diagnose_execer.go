@@ -55,13 +55,25 @@ func (d *DiagnoseExecer) Run(binary string, args []string, env []string) (*RunRe
 
 	stopSignals := forwardSignals(cmd.Process)
 
+	// Drain the capture goroutine BEFORE cmd.Wait. The os/exec docs warn:
+	// "Wait will close the pipe after seeing the command exit […] it is
+	// thus incorrect to call Wait before all reads from the pipe have
+	// completed." If Wait closes the read end while captureStderr is still
+	// reading, the goroutine sees a premature error and we lose data
+	// (manifesting as StderrTruncatedBytes == 0 on fast/short outputs).
+	// Channel receives block until the goroutine has read EOF, which only
+	// happens once the child has closed its stderr fd (i.e. has exited),
+	// so the subsequent cmd.Wait simply reaps the already-exited child.
+	stderrTail := <-tail
+	stderrTrunc := <-truncated
+
 	err = cmd.Wait()
 	close(stopSignals)
 
 	res := &RunResult{
 		Runtime:              time.Since(start),
-		StderrTail:           <-tail,
-		StderrTruncatedBytes: <-truncated,
+		StderrTail:           stderrTail,
+		StderrTruncatedBytes: stderrTrunc,
 		Pid:                  childPid,
 	}
 	if err == nil {

@@ -25,6 +25,7 @@ func mockLookPath(available map[string]string) LookPathFunc {
 }
 
 func TestPassthrough_SingleAgent(t *testing.T) {
+	requireClaudeHome(t)
 	ctrl := gomock.NewController(t)
 	var capturedBinary string
 	var capturedArgs []string
@@ -194,6 +195,7 @@ func TestPassthrough_AgentOverrideNotOnPath(t *testing.T) {
 }
 
 func TestPassthrough_FirstRunSentinel(t *testing.T) {
+	requireClaudeHome(t)
 	configHome := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
@@ -249,6 +251,7 @@ func TestScanAgents(t *testing.T) {
 }
 
 func TestPassthrough_YoloInjectsFlag(t *testing.T) {
+	requireClaudeHome(t)
 	ctrl := gomock.NewController(t)
 	var capturedBinary string
 	var capturedArgs []string
@@ -286,6 +289,7 @@ func TestPassthrough_YoloInjectsFlag(t *testing.T) {
 }
 
 func TestPassthrough_NoYoloOverridesYolo(t *testing.T) {
+	requireClaudeHome(t)
 	ctrl := gomock.NewController(t)
 	var capturedBinary string
 	var capturedArgs []string
@@ -325,6 +329,7 @@ func TestPassthrough_NoYoloOverridesYolo(t *testing.T) {
 }
 
 func TestPassthrough_YoloWarningShown(t *testing.T) {
+	requireClaudeHome(t)
 	ctrl := gomock.NewController(t)
 	mockExec := mocks.NewMockExecer(ctrl)
 	mockExec.EXPECT().Exec(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
@@ -471,6 +476,7 @@ func TestPassthrough_ExecAgent_UsesCwd(t *testing.T) {
 }
 
 func TestPassthrough_NoOptOut_AlwaysSandboxed(t *testing.T) {
+	requireClaudeHome(t)
 	// Verify that execAgent always applies sandbox — there is no parameter or
 	// field on Launcher that can disable sandbox in passthrough mode.
 	ctrlNO := gomock.NewController(t)
@@ -557,6 +563,42 @@ func TestPassthrough_NoConfigNoAgents_ErrorListsCursorAgent(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cursor-agent") {
 		t.Errorf("error message should mention cursor-agent, got: %s", err.Error())
+	}
+}
+
+// TestPassthrough_BannerReflectsActiveSandboxTier guards against a regression
+// where execAgent constructs BannerData without populating IsolationTier. The
+// compact-template's isolationTierLabel falls back to "sandbox: disabled"
+// whenever IsolationTier is nil, so the banner would lie even though Landlock
+// (or Seatbelt) is in fact applied via sb.Apply. The fix populates
+// IsolationTier from sandbox.PlatformIsolationTier on the actual policy.
+func TestPassthrough_BannerReflectsActiveSandboxTier(t *testing.T) {
+	requireClaudeHome(t)
+	ctrl := gomock.NewController(t)
+	mockExec := mocks.NewMockExecer(ctrl)
+	mockExec.EXPECT().Exec(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+	var stderrBuf bytes.Buffer
+	l := &Launcher{
+		Execer:   mockExec,
+		LookPath: mockLookPath(map[string]string{"claude": "/usr/local/bin/claude"}),
+		Stderr:   &stderrBuf,
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+	if err := l.Passthrough(t.TempDir(), "", nil); err != nil {
+		t.Fatalf("Passthrough failed: %v", err)
+	}
+
+	banner := stderrBuf.String()
+	if strings.Contains(banner, "sandbox: disabled") {
+		t.Errorf("banner reports sandbox disabled but sb.Apply was invoked; banner:\n%s", banner)
+	}
+	// On any supported platform the active backend produces a recognisable
+	// label fragment. We accept either Landlock (Linux) or Seatbelt (darwin)
+	// so the test stays platform-agnostic.
+	if !strings.Contains(banner, "sandbox: primary") && !strings.Contains(banner, "sandbox: degraded") {
+		t.Errorf("banner is missing the IsolationTier label; expected 'sandbox: primary' or 'sandbox: degraded'; got:\n%s", banner)
 	}
 }
 

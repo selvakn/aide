@@ -48,7 +48,7 @@ aide auto-detects known agent config directories and adds them to the writable l
 |--------------|---------------------|---------------------------------------|
 | Aider        | (none)              | `~/.aider`                            |
 | Amp          | `AMP_HOME`          | `~/.amp`, `~/.config/amp`             |
-| Claude       | `CLAUDE_CONFIG_DIR` | `~/.claude`, `~/.config/claude`, `~/Library/Application Support/Claude` |
+| Claude       | `CLAUDE_CONFIG_DIR` | **Linux**: `~/.config/aide/claude` (aide-managed redirect; this is the only path in the Landlock writable allow-list). **macOS**: `~/.claude`, `~/.config/claude`, `~/Library/Application Support/Claude`. Setting `CLAUDE_CONFIG_DIR` to a path outside the managed directory on Linux requires adding it to `writable_extra`. |
 | Codex        | `CODEX_HOME`        | `~/.codex`                            |
 | Cursor       | `CURSOR_CONFIG_DIR` | `~/.cursor` (also `$XDG_CONFIG_HOME/cursor` on Linux when set) |
 | Gemini       | `GEMINI_HOME`       | `~/.gemini`                           |
@@ -216,12 +216,32 @@ aide sandbox reset
 
 ## Platform Details
 
-| Platform           | Mechanism                              | Notes                                         |
-|--------------------|----------------------------------------|-----------------------------------------------|
-| macOS              | `sandbox-exec` (Seatbelt)             | Generates a `.sb` profile dynamically at run time |
-| Linux              | —                                      | Planned, not yet implemented                  |
+| Platform | Mechanism | Isolation tier | Notes |
+|----------|-----------|---------------|-------|
+| macOS | `sandbox-exec` (Seatbelt) | primary | Generates a `.sb` profile dynamically at run time |
+| Linux (kernel ≥ 6.7) | Landlock (ABI ≥ 4) | primary | Full filesystem + TCP port enforcement |
+| Linux (kernel 5.13–6.6) | Landlock (ABI 1–3) | primary / degraded | Filesystem isolation; TCP port filtering unavailable (degraded if port rules configured) |
+| Linux (no Landlock) | bubblewrap (`bwrap`) | degraded | Filesystem namespace isolation; no per-port TCP control |
+| Linux (no Landlock, no bwrap) | — | unavailable | Agent launches with a warning; no OS-level isolation |
 
-Currently only macOS is supported. Linux sandbox support (e.g. Landlock, bubblewrap) is planned but not yet implemented.
+### Supported Linux tier (minimum system requirements)
+
+For **primary** isolation on Linux:
+
+- Kernel ≥ 6.7 (ships Landlock ABI 4 with TCP port enforcement)
+- Landlock enabled in the kernel LSM list (`/sys/kernel/security/lsm` contains `landlock`)
+
+For **degraded** isolation (filesystem only, no port filtering):
+
+- Kernel ≥ 5.13 (Landlock ABI 1) — or — `bwrap` on PATH
+
+When neither is available, aide logs `aide: warning: OS-level sandboxing unavailable` to stderr and launches the agent without restriction. Run `aide sandbox show` to confirm the active tier.
+
+### Linux vs macOS differences
+
+- **Filesystem**: macOS Seatbelt enforces per-subpath rules including glob patterns. Landlock enforces directory-level rules (no per-file glob inside a writable directory).
+- **Network**: Both enforce mode (outbound / none / unrestricted). Port allow/deny lists require Landlock ABI ≥ 4 on Linux; all ports apply on earlier kernels.
+- **Diagnostics**: `aide sandbox test` on Linux prints a human-readable profile; on macOS it prints the raw `.sb` file.
 
 ## Debugging
 
@@ -237,7 +257,29 @@ aide sandbox test
 aide sandbox test --context myproject
 ```
 
-`aide sandbox show` prints the merged policy (defaults + profile + inline + extra fields). `aide sandbox test` outputs the raw Seatbelt `.sb` profile on macOS, which is useful for confirming that paths resolve correctly before running an agent.
+`aide sandbox show` prints the merged policy including the **Isolation tier** and **Backend** lines on Linux, so you can confirm whether you are running primary (Landlock), degraded (bwrap), or unavailable.
+
+`aide sandbox test` outputs the platform-specific profile — the raw Seatbelt `.sb` file on macOS, or the Landlock/bwrap path summary on Linux.
+
+### Linux troubleshooting
+
+If `aide sandbox show` reports an unexpected tier, check the following:
+
+```sh
+# Confirm Landlock appears in the active LSM list
+cat /sys/kernel/security/lsm
+
+# Check the Landlock ABI version the kernel exposes
+aide sandbox test   # look for "# Tier:" and "# Backend:" in output
+
+# Check kernel messages for Landlock-related entries
+dmesg | grep -i landlock
+
+# Verify bwrap is available as a fallback
+which bwrap && bwrap --version
+```
+
+If `dmesg | grep -i landlock` shows nothing but `/sys/kernel/security/lsm` lists `landlock`, the LSM is compiled in and active — the ABI version determines which features are available. Kernels before 6.7 support filesystem isolation (ABI 1–3) but not TCP port rules (ABI 4 required).
 
 ### Cursor agent troubleshooting
 

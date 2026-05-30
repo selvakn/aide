@@ -49,7 +49,7 @@ func (d *darwinSandbox) Apply(cmd *exec.Cmd, policy Policy, runtimeDir string) e
 
 	// 4. Handle clean_env (DD-17)
 	if policy.CleanEnv {
-		cmd.Env = filterEnv(cmd.Env)
+		cmd.Env = filterEnv(cmd.Env, policy)
 	}
 
 	return nil
@@ -63,8 +63,6 @@ func (d *darwinSandbox) GenerateProfile(policy Policy) (string, error) {
 // generateSeatbeltProfile builds a Seatbelt .sb profile string from a Policy
 // by composing modules from the guard registry.
 func generateSeatbeltProfile(policy Policy) (string, error) {
-	homeDir, _ := os.UserHomeDir()
-
 	// Safety: ensure base guard is present
 	hasBase := false
 	for _, name := range policy.Guards {
@@ -79,9 +77,9 @@ func generateSeatbeltProfile(policy Policy) (string, error) {
 
 	activeGuards := guards.ResolveActiveGuards(policy.Guards)
 
-	p := seatbelt.New(homeDir).
+	p := seatbelt.New(policy.HomeDir).
 		WithContext(func(c *seatbelt.Context) {
-			*c = *policy.ToSeatbeltContext(homeDir)
+			*c = *policy.ToSeatbeltContext()
 		})
 
 	for _, g := range activeGuards {
@@ -97,5 +95,12 @@ func generateSeatbeltProfile(policy Policy) (string, error) {
 		return "", err
 	}
 	return result.Profile, nil
+}
+
+// PlatformGrantedPaths falls back to DeriveGrantedPathSet on macOS; the
+// Seatbelt backend does not augment the set with OS bootstrap entries at the
+// GrantedPathSet level (they are embedded directly in the .sb profile).
+func PlatformGrantedPaths(policy Policy) GrantedPathSet {
+	return DeriveGrantedPathSet(policy)
 }
 

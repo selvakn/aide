@@ -30,6 +30,21 @@ func skipIfNoBwrap(t *testing.T) {
 	}
 }
 
+// skipIfNoBwrapMount probes only mount-namespace + tmpfs/bind support, so tests
+// run on hosts where unprivileged user-namespace creation is blocked.
+func skipIfNoBwrapMount(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not on PATH -- skipping integration test")
+	}
+	cmd := exec.Command("bwrap",
+		"--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+		"--", "/bin/true")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("bwrap cannot create a mount namespace on this host: %v -- skipping integration test", err)
+	}
+}
+
 func TestLinuxIntegration_BwrapDeniedPathBlocked(t *testing.T) {
 	skipIfNoBwrap(t)
 
@@ -126,6 +141,177 @@ func TestLinuxIntegration_MinimalPolicyExecEcho(t *testing.T) {
 		t.Errorf("unexpected output: %s", output)
 	}
 }
+
+// TestLinuxIntegration_DefaultPolicy_SSHNotReadable verifies that with the default policy
+// (no extra capabilities), the agent cannot read ~/.ssh.
+func TestLinuxIntegration_DefaultPolicy_SSHNotReadable(t *testing.T) {
+	skipIfNoBwrap(t)
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot determine home dir")
+	}
+	sshDir := filepath.Join(home, ".ssh")
+	if _, err := os.Stat(sshDir); os.IsNotExist(err) {
+		t.Skip("~/.ssh does not exist on this system")
+	}
+
+	writableDir := t.TempDir()
+	runtimeDir := t.TempDir()
+
+	policy := Policy{
+		ProjectRoot:     writableDir,
+		RuntimeDir:      runtimeDir,
+		TempDir:         os.TempDir(),
+		Network:         NetworkNone,
+		AllowSubprocess: true,
+		Guards:          []string{},
+	}
+
+	// Try to list ~/.ssh through the sandbox
+	cmd := exec.Command("/bin/ls", sshDir)
+	cmd.Env = os.Environ()
+
+	s := &LinuxSandbox{}
+	bwrapPath, _ := exec.LookPath("bwrap")
+	if err := s.applyBwrap(cmd, policy, bwrapPath); err != nil {
+		t.Fatalf("applyBwrap failed: %v", err)
+	}
+
+	_, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Error("agent should NOT be able to read ~/.ssh with default policy (no coarse $HOME allow)")
+	} else {
+		t.Logf("correctly blocked ~/.ssh access: %v", err)
+	}
+}
+
+// TestLinuxIntegration_DefaultPolicy_ProjectRootReadable verifies project root remains readable.
+func TestLinuxIntegration_DefaultPolicy_ProjectRootReadable(t *testing.T) {
+	skipIfNoBwrap(t)
+
+	writableDir := t.TempDir()
+	testFile := filepath.Join(writableDir, "hello.txt")
+	if err := os.WriteFile(testFile, []byte("hello"), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	policy := Policy{
+		ProjectRoot:     writableDir,
+		RuntimeDir:      t.TempDir(),
+		TempDir:         os.TempDir(),
+		Network:         NetworkNone,
+		AllowSubprocess: true,
+		Guards:          []string{},
+	}
+
+	gps := DeriveGrantedPathSet(policy)
+
+	cmd := exec.Command("/bin/cat", testFile)
+	cmd.Env = os.Environ()
+
+	s := &LinuxSandbox{}
+	bwrapPath, _ := exec.LookPath("bwrap")
+	// Build bwrap args manually using GrantedPathSet
+	var bwrapArgs []string
+	for _, p := range gps.Writable {
+		bwrapArgs = append(bwrapArgs, "--bind", p, p)
+	}
+	for _, p := range gps.Readable {
+		bwrapArgs = append(bwrapArgs, "--ro-bind-try", p, p)
+	}
+	bwrapArgs = append(bwrapArgs,
+		"--ro-bind", "/usr", "/usr",
+		"--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+	)
+	for _, lib := range []string{"/lib", "/lib64"} {
+		if _, err := os.Stat(lib); err == nil {
+			bwrapArgs = append(bwrapArgs, "--ro-bind", lib, lib)
+		}
+	}
+	bwrapArgs = append(bwrapArgs, "--", "/bin/cat", testFile)
+
+	cmd.Path = bwrapPath
+	cmd.Args = append([]string{"bwrap"}, bwrapArgs...)
+	_ = s // use s to avoid unused warning
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("project root should be readable: %v, output: %s", err, output)
+	}
+	if string(output) != "hello" {
+		t.Errorf("unexpected output: %q, want %q", string(output), "hello")
+	}
+}
+
+// TestLinuxIntegration_AllowSubprocessFalse_Bwrap_BlocksFork asserts that the
+// bwrap-only fallback honours AllowSubprocess=false by blocking subprocess
+// creation outright, not merely isolating it via a PID namespace. The shell
+// inside the sandbox attempts to spawn /bin/true; the seccomp filter we install
+// must block the underlying clone()-without-CLONE_THREAD so the shell's `&&`
+// branch never runs and the `||` branch prints FORK_BLOCKED instead.
+func TestLinuxIntegration_AllowSubprocessFalse_Bwrap_BlocksFork(t *testing.T) {
+	skipIfNoBwrap(t)
+
+	bwrapPath, _ := exec.LookPath("bwrap")
+	s := &LinuxSandbox{}
+	policy := Policy{
+		ProjectRoot:     t.TempDir(),
+		RuntimeDir:      t.TempDir(),
+		TempDir:         "/tmp",
+		Network:         NetworkOutbound,
+		AllowSubprocess: false,
+	}
+
+	cmd := exec.Command("/bin/sh", "-c",
+		`/bin/true 2>/dev/null && echo FORK_WORKED || echo FORK_BLOCKED`)
+	if err := s.applyBwrap(cmd, policy, bwrapPath); err != nil {
+		t.Fatalf("applyBwrap: %v", err)
+	}
+
+	out, _ := cmd.CombinedOutput()
+	output := string(out)
+	if strings.Contains(output, "FORK_WORKED") {
+		t.Errorf("AllowSubprocess=false should block subprocess creation; output: %s", output)
+	}
+	if !strings.Contains(output, "FORK_BLOCKED") {
+		t.Errorf("expected FORK_BLOCKED in output; got: %s", output)
+	}
+}
+
+// TestLinuxIntegration_AllowSubprocessFalse_BwrapUsesSeccomp asserts the
+// bwrap fallback uses --seccomp for subprocess enforcement (not --unshare-pid,
+// which was removed because seccomp is the hard blocker).
+func TestLinuxIntegration_AllowSubprocessFalse_BwrapUsesSeccomp(t *testing.T) {
+	skipIfNoBwrap(t)
+
+	bwrapPath, _ := exec.LookPath("bwrap")
+	s := &LinuxSandbox{}
+	policy := Policy{
+		ProjectRoot:     t.TempDir(),
+		RuntimeDir:      t.TempDir(),
+		TempDir:         "/tmp",
+		Network:         NetworkOutbound,
+		AllowSubprocess: false,
+	}
+	cmd := exec.Command("/bin/echo", "hello")
+	if err := s.applyBwrap(cmd, policy, bwrapPath); err != nil {
+		t.Fatalf("applyBwrap: %v", err)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if strings.Contains(args, "--unshare-pid") {
+		t.Errorf("--unshare-pid must not be present (seccomp is the enforcement layer): %s", args)
+	}
+	if !strings.Contains(args, "--seccomp") {
+		t.Errorf("--seccomp must be present for AllowSubprocess=false: %s", args)
+	}
+}
+
+// Note: the --unshare-pid coverage for the overlay path moved to
+// TestBuildOverlayBwrapArgs_UnsharePidAndNetwork in atomic_overlay_test.go,
+// which exercises the new buildOverlayBwrapArgs directly (no bwrap launch
+// needed, so runs on any Linux).
 
 func TestLinuxIntegration_SandboxRefResolution(t *testing.T) {
 	skipIfNoBwrap(t)
