@@ -66,6 +66,33 @@ func TestLinuxSandbox_LandlockAvailable(t *testing.T) {
 	t.Logf("Landlock available: %v (ABI %d)", caps.LandlockEnabled, caps.LandlockABI)
 }
 
+// TestLinuxSandbox_ApplyBwrap_BindsAgentBinary pins the fix for the missing
+// agent-binary bind: without an explicit --ro-bind the agent executable is
+// absent from the new bwrap filesystem namespace and execve fails with ENOENT.
+func TestLinuxSandbox_ApplyBwrap_BindsAgentBinary(t *testing.T) {
+	s := &LinuxSandbox{}
+	cmd := exec.Command("/usr/bin/echo", "hello")
+	policy := Policy{
+		Network:         NetworkOutbound,
+		AllowSubprocess: true,
+	}
+
+	bwrapPath, err := exec.LookPath("bwrap")
+	if err != nil {
+		t.Skip("bwrap not on PATH")
+	}
+
+	if err := s.applyBwrap(cmd, policy, bwrapPath); err != nil {
+		t.Fatalf("applyBwrap error: %v", err)
+	}
+
+	args := strings.Join(cmd.Args, " ")
+	want := "--ro-bind-try /usr/bin/echo /usr/bin/echo"
+	if !strings.Contains(args, want) {
+		t.Errorf("agent binary not bound into namespace; missing %q in: %s", want, args)
+	}
+}
+
 func TestLinuxSandbox_ApplyBwrap_BasicArgs(t *testing.T) {
 	s := &LinuxSandbox{}
 	cmd := exec.Command("/usr/bin/echo", "hello")

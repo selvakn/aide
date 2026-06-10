@@ -6,6 +6,16 @@ package sandbox
 
 import "fmt"
 
+// maxLandlockNetRules is the maximum number of ConnectTCP rules installed in a
+// single Landlock network ruleset. deny_complement mode generates one rule per
+// allowed port; exceeding this threshold makes sandbox activation prohibitively
+// slow and approaches the per-ruleset kernel ceiling (LANDLOCK_MAX_NUM_RULES =
+// 65536). When the complement exceeds this bound DerivePortPolicy sets
+// Enforceable=false with an empty AllowSet, causing shouldGateNetwork to apply
+// RestrictNet with zero rules — blocking all outbound TCP as a fail-closed
+// degradation. Exposed as a var so tests can override it.
+var maxLandlockNetRules = 4096
+
 // PortPolicyEffective is the resolved port enforcement descriptor.
 // Mode is one of: "unrestricted", "allow_only", "deny_complement",
 // "allow_intersect_deny". Enforceable is false when the backend cannot honour
@@ -73,6 +83,18 @@ func DerivePortPolicy(policy Policy, landlockABI4 bool) PortPolicyEffective {
 			p := uint16(i) //nolint:gosec // i ∈ [1,65535] by loop bounds
 			if !denySet[p] {
 				allowSet = append(allowSet, p)
+			}
+		}
+		// When the complement is larger than maxLandlockNetRules, installing
+		// that many ConnectTCP rules is both slow and within 2 of the kernel's
+		// per-ruleset ceiling (LANDLOCK_MAX_NUM_RULES = 65536). Degrade to
+		// Enforceable=false with an empty AllowSet so that shouldGateNetwork
+		// still fires but RestrictNet receives zero rules, blocking all outbound
+		// TCP connections (fail-closed). The caller emits a warning.
+		if len(allowSet) > maxLandlockNetRules {
+			return PortPolicyEffective{
+				Mode:        "deny_complement",
+				Enforceable: false,
 			}
 		}
 		return PortPolicyEffective{

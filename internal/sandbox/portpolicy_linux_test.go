@@ -44,30 +44,56 @@ func TestDerivePortPolicy_AllowOnly_NotEnforceableOnABI3(t *testing.T) {
 	}
 }
 
-func TestDerivePortPolicy_DenyComplement(t *testing.T) {
+// TestDerivePortPolicy_DenyComplement_AboveThreshold verifies the fail-closed
+// behaviour: denying a small number of ports yields a complement larger than
+// maxLandlockNetRules, so the policy must be non-enforceable with an empty
+// AllowSet. shouldGateNetwork still fires, and RestrictNet with zero rules
+// blocks all outbound TCP connections.
+func TestDerivePortPolicy_DenyComplement_AboveThreshold(t *testing.T) {
+	// 2 denied ports → 65533 allowed ports, always > maxLandlockNetRules (4096).
 	policy := Policy{DenyPorts: []int{22, 80}}
 	pp := DerivePortPolicy(policy, true)
 
 	if pp.Mode != "deny_complement" {
 		t.Errorf("Mode = %q, want deny_complement", pp.Mode)
 	}
-	// Denied ports must be absent.
-	if containsPort(pp.AllowSet, 22) {
-		t.Error("port 22 should be excluded from AllowSet (denied)")
+	if pp.Enforceable {
+		t.Error("deny_complement above maxLandlockNetRules must not be enforceable")
 	}
-	if containsPort(pp.AllowSet, 80) {
-		t.Error("port 80 should be excluded from AllowSet (denied)")
+	if len(pp.AllowSet) != 0 {
+		t.Errorf("AllowSet must be empty when above threshold; got %d entries", len(pp.AllowSet))
 	}
-	// Well-known ports NOT in CommonPorts must be present (previously missing).
-	for _, port := range []int{443, 5173, 8888, 9090, 1234, 65535} {
-		if !containsPort(pp.AllowSet, port) {
-			t.Errorf("port %d should be in AllowSet (not denied)", port)
-		}
+}
+
+// TestDerivePortPolicy_DenyComplement_WithinThreshold verifies that when the
+// complement is small enough (≤ maxLandlockNetRules), the policy is enforceable
+// and AllowSet contains exactly the non-denied ports.
+func TestDerivePortPolicy_DenyComplement_WithinThreshold(t *testing.T) {
+	// Deny ports 1..61439 so that only 4096 ports (61440–65535) remain.
+	const denyCount = 61439
+	deny := make([]int, denyCount)
+	for i := range deny {
+		deny[i] = i + 1
 	}
-	// AllowSet is the full range (1–65535) minus 2 denied ports.
-	wantLen := 65535 - 2
+	policy := Policy{DenyPorts: deny}
+	pp := DerivePortPolicy(policy, true)
+
+	if pp.Mode != "deny_complement" {
+		t.Errorf("Mode = %q, want deny_complement", pp.Mode)
+	}
+	if !pp.Enforceable {
+		t.Error("deny_complement within threshold must be enforceable on ABI4")
+	}
+	wantLen := 65535 - denyCount
 	if len(pp.AllowSet) != wantLen {
-		t.Errorf("AllowSet len = %d, want %d (full range minus 2 denied ports)", len(pp.AllowSet), wantLen)
+		t.Errorf("AllowSet len = %d, want %d", len(pp.AllowSet), wantLen)
+	}
+	// Denied ports must be absent; a non-denied port must be present.
+	if containsPort(pp.AllowSet, 1) {
+		t.Error("port 1 (denied) must not be in AllowSet")
+	}
+	if !containsPort(pp.AllowSet, 65535) {
+		t.Error("port 65535 (not denied) must be in AllowSet")
 	}
 }
 

@@ -522,6 +522,13 @@ func RunSandboxApply(policyFDStr string, agentCmd []string) error {
 	}
 	caps := DetectKernelCapabilities()
 	portPolicy := DerivePortPolicy(policy, caps.LandlockABI >= 4)
+	if portPolicy.Mode == "deny_complement" && !portPolicy.Enforceable && caps.LandlockABI >= 4 {
+		// deny_complement complement exceeds maxLandlockNetRules: we cannot install
+		// 65K+ ConnectTCP rules efficiently. Fail closed: all outbound TCP blocked.
+		fmt.Fprintf(os.Stderr,
+			"aide: warning: deny_complement port policy not enforceable (complement of %d denied port(s) exceeds the %d-rule limit); all outbound TCP connections will be blocked\n",
+			len(policy.DenyPorts), maxLandlockNetRules)
+	}
 
 	cfg := landlock.V5.BestEffort()
 
@@ -532,11 +539,11 @@ func RunSandboxApply(policyFDStr string, agentCmd []string) error {
 	}
 
 	// Network restriction — separate ruleset so filesystem rules and network
-	// rules never share a ruleset. deny_complement generates up to 65534
-	// ConnectTCP rules; combined with ~50 filesystem rules in a single ruleset
-	// that would exceed the kernel's 65536-rule-per-ruleset ceiling (EMFILE).
-	// Calling RestrictNet separately keeps each ruleset well within the limit.
-	// RestrictNet with zero rules (NetworkNone) blocks all TCP connections.
+	// rules never share a ruleset. deny_complement with a small deny list
+	// generates up to maxLandlockNetRules ConnectTCP rules; DerivePortPolicy
+	// marks it non-enforceable when over that threshold (fail-closed: all TCP
+	// blocked). RestrictNet with zero rules (NetworkNone or non-enforceable
+	// deny_complement) blocks all outbound TCP connections.
 	if shouldGateNetwork(policy.Network, portPolicy) {
 		var portRules []landlock.Rule
 		for _, port := range portPolicy.AllowSet {
@@ -814,6 +821,12 @@ func (l *LinuxSandbox) GenerateProfile(policy Policy) (string, error) {
 func (l *LinuxSandbox) applyBwrap(cmd *exec.Cmd, policy Policy, bwrapPath string) error {
 	var bwrapArgs []string
 
+	// Capture the agent binary path before cmd.Path is overwritten to bwrapPath
+	// below. Without an explicit --ro-bind the agent executable is absent from
+	// the new filesystem namespace and execve fails with ENOENT, because bwrap
+	// starts with an empty root and only exposes paths the caller binds in.
+	agentBin := cmd.Path
+
 	gps := linuxGrantedPaths(policy)
 	writable := gps.Writable
 	readable := gps.Readable
@@ -827,6 +840,21 @@ func (l *LinuxSandbox) applyBwrap(cmd *exec.Cmd, policy Policy, bwrapPath string
 	// Readable paths: --ro-bind-try src src
 	for _, p := range readable {
 		bwrapArgs = append(bwrapArgs, "--ro-bind-try", p, p)
+	}
+
+	// Bind the agent binary into the namespace so it can be exec'd. --ro-bind-try
+	// silently skips absent paths, but the agent binary must exist at this point
+	// (we resolved and stat'd it before reaching here). The symlink target is also
+	// bound so execve following the chain finds the real ELF. Both the binary and
+	// its resolved path are bound to cover hosts where the install location is a
+	// symlink (e.g. ~/.nix-profile/bin/claude → /nix/store/.../claude). Using the
+	// -try variant for the resolved path handles hosts where EvalSymlinks returns
+	// an error for a non-symlink binary.
+	if agentBin != "" {
+		bwrapArgs = append(bwrapArgs, "--ro-bind-try", agentBin, agentBin)
+		if resolved, err := filepath.EvalSymlinks(agentBin); err == nil && resolved != agentBin {
+			bwrapArgs = append(bwrapArgs, "--ro-bind-try", resolved, resolved)
+		}
 	}
 
 	// System essentials. Mirror linuxSystemReadable so the bwrap fallback
